@@ -1,19 +1,9 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+<style>html{padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}</style>
 <title>Show Up Every Day</title>
 <meta charset="UTF-8">
-<script>
-if(typeof window.claude==='undefined'){window.claude={use:async function(n){
-  if(n!=='downloads')return null;
-  return{save:async function(o){
-    var f=o.filename,mime=/\.json$/.test(f)?'application/json':/\.csv$/.test(f)?'text/csv':/\.pdf$/.test(f)?'application/pdf':'application/octet-stream';
-    var b=(o.data instanceof Blob)?o.data:new Blob([o.data],{type:mime});
-    var a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=f;document.body.appendChild(a);a.click();
-    setTimeout(function(){a.remove();URL.revokeObjectURL(a.href)},4000);
-  }};
-}}}
-</script>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#0b1020">
 <meta name="apple-mobile-web-app-title" content="Streak">
@@ -721,6 +711,7 @@ body{animation:none;background-size:100% 100%}
         <button class="tool" id="view"><i>👁️</i><b>View data</b><small>See everything before you export</small></button>
         <button class="tool" id="exp"><i>⬇️</i><b>Download backup</b><small>Save everything as a .json file</small></button>
         <button class="tool" id="imp"><i>⬆️</i><b>Restore backup</b><small>Load a saved .json file</small></button>
+        <button class="tool" id="ghBtn"><i>☁️</i><b>GitHub backup</b><small id="ghSm">Not connected yet</small></button>
         <button class="tool danger" id="reset"><i>🗑️</i><b>Reset month</b><small>Erase one month's data</small></button>
       </div>
       <div class="syncrow"><i class="sd"></i><span id="sync">Saved on this device</span></div>
@@ -731,6 +722,27 @@ body{animation:none;background-size:100% 100%}
 </main>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script>
+/* Standalone-site shim: the page was built inside Claude, where window.claude exists.
+   On a normal website it does not, so downloads are provided here and the
+   account-sync calls are declined (the GitHub backup below replaces them). */
+(function(){
+  if(window.claude&&typeof window.claude.use==='function')return;
+  window.claude={use:function(name){
+    if(name==='downloads'){
+      return Promise.resolve({save:function(o){
+        var b=(o.data instanceof Blob)?o.data:new Blob([o.data],{type:/\.json$/i.test(o.filename)?'application/json':(/\.csv$/i.test(o.filename)?'text/csv':'text/plain')});
+        var a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=o.filename;
+        document.body.appendChild(a);a.click();a.remove();
+        setTimeout(function(){URL.revokeObjectURL(a.href)},4000);
+        return Promise.resolve();
+      }});
+    }
+    return Promise.reject(new Error('unavailable'));
+  }};
+})();
+</script>
+
 <script>
 const KEY='consistency-marks';
 const T={
@@ -815,6 +827,7 @@ function pushCloud(){
 }
 function save(){
   localTs=Date.now();persist();
+  if(window.ghQueue)ghQueue();
   if(cloudDoc){setStat('☁️ Saving…');clearTimeout(timer);timer=setTimeout(pushCloud,600)}
 }
 const pad=n=>String(n).padStart(2,'0');
@@ -1780,5 +1793,150 @@ fi.onchange=()=>{
   $('reset').onclick=open;
 })();
 </script>
+<style>
+.ghf{display:flex;flex-direction:column;gap:10px;margin:12px 0;text-align:left}
+.ghf label{display:flex;flex-direction:column;gap:4px;font-size:.78rem;opacity:.85}
+.ghf input,.ghf select{font:inherit;font-size:.9rem;padding:10px 12px;border-radius:12px;border:1px solid var(--line);background:#ffffff14;color:inherit;width:100%;box-sizing:border-box}
+.ghrow{display:flex;gap:8px;flex-wrap:wrap;margin:6px 0}
+.ghst{font-size:.82rem;margin:6px 0;min-height:1.2em}
+.ghhelp{font-size:.74rem;opacity:.75;line-height:1.5;text-align:left}
+.ghhelp a{color:inherit;text-decoration:underline}
+</style>
+<script>
+/* ---- Automatic GitHub backup + restore (works on the hosted site) ---- */
+(function(){
+  var GK='consistency-gh',cfg={};
+  try{cfg=JSON.parse(localStorage.getItem(GK)||'{}')}catch(e){}
+  var last='',timer=null,busy=false,again=false,lastMsg='';
+  var $=function(id){return document.getElementById(id)};
+  function on(){return !!(cfg.token&&/^[\w.-]+\/[\w.-]+$/.test(cfg.repo||''))}
+  function saveCfg(){try{localStorage.setItem(GK,JSON.stringify(cfg))}catch(e){}}
+  function sm(){var s=$('ghSm');if(s)s.textContent=on()?('Auto-backup on · '+cfg.repo):'Not connected yet'}
+  function stat(t){lastMsg=t;try{setStat(t)}catch(e){}var g=$('ghst');if(g)g.textContent=t}
+  function hhmm(){var d=new Date();return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')}
+  function url(p){return 'https://api.github.com/repos/'+cfg.repo+'/contents/'+p.split('/').map(encodeURIComponent).join('/')}
+  function hdr(x){return Object.assign({'Authorization':'Bearer '+cfg.token,'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'},x||{})}
+  function b64(s){return btoa(unescape(encodeURIComponent(s)))}
+  function unb64(s){return decodeURIComponent(escape(atob(String(s).replace(/\s/g,''))))}
+  function q(){return cfg.branch?('?ref='+encodeURIComponent(cfg.branch)):''}
+  function fail(r){
+    var e=new Error('GitHub '+r.status);e.status=r.status;return e}
+  async function getFile(p){
+    var r=await fetch(url(p)+q(),{headers:hdr(),cache:'no-store'});
+    if(r.status===404)return null;
+    if(!r.ok)throw fail(r);
+    return r.json();
+  }
+  async function putFile(p,text,message){
+    var ex=await getFile(p),body={message:message,content:b64(text)};
+    if(ex&&ex.sha)body.sha=ex.sha;
+    if(cfg.branch)body.branch=cfg.branch;
+    var r=await fetch(url(p),{method:'PUT',headers:hdr({'Content-Type':'application/json'}),body:JSON.stringify(body)});
+    if(!r.ok)throw fail(r);
+  }
+  function explain(e){
+    if(e&&e.status===401)return '⚠️ GitHub rejected the token. Open GitHub backup and paste a new one.';
+    if(e&&(e.status===403||e.status===404))return '⚠️ GitHub cannot reach that repository. Check the name and that the token has Contents: Read and write.';
+    return '⚠️ GitHub backup failed, saved on this device only. It will retry on your next change.';
+  }
+  function core(){return JSON.stringify({marks:marks,meta:meta})}
+  function payload(){var d=backupData();d.updated=localTs||Date.now();return JSON.stringify(d,null,2)}
+  async function push(force){
+    if(!on())return;
+    if(busy){again=true;return}
+    var c=core();
+    if(!force&&c===last)return;
+    busy=true;stat('☁️ Backing up to GitHub…');
+    try{
+      var text=payload(),day=ymd(new Date()),stamp=new Date().toISOString();
+      await putFile('backups/latest.json',text,'Auto backup '+stamp);
+      await putFile('snapshots/'+day+'.json',text,'Daily snapshot '+day);
+      last=c;stat('✅ Backed up to GitHub at '+hhmm());
+    }catch(e){stat(explain(e))}
+    busy=false;
+    if(again){again=false;queue()}
+  }
+  function queue(){
+    if(!on())return;
+    clearTimeout(timer);stat('☁️ Change saved, backing up shortly…');
+    timer=setTimeout(function(){push(false)},12000);
+  }
+  window.ghQueue=queue;
+  document.addEventListener('visibilitychange',function(){
+    if(document.visibilityState==='hidden'&&timer){clearTimeout(timer);timer=null;push(false)}
+  });
+  function clean(j){
+    var m=(j&&j.marks)||j||{},out={};
+    Object.keys(m).forEach(function(k){if(/^\d{4}-\d{2}-\d{2}$/.test(k)&&(m[k]==='g'||m[k]==='r'))out[k]=m[k]});
+    return out;
+  }
+  /* quiet=true: pulled automatically on load, keep the file's own timestamp so it is not re-pushed */
+  function applyData(j,quiet){
+    marks=clean(j);meta=normMeta(j&&j.meta);
+    if(quiet){localTs=+j.updated||Date.now();persist();last=core()}
+    else{save()}
+    closeMonths();render();
+  }
+  async function init(){
+    if(!on()){sm();return}
+    stat('☁️ Checking GitHub…');
+    try{
+      var f=await getFile('backups/latest.json');
+      var j=f&&f.content?JSON.parse(unb64(f.content)):null;
+      if(j&&j.marks&&(+j.updated||0)>localTs){applyData(j,true);stat('✅ Loaded your latest backup from GitHub');}
+      else await push(true);
+    }catch(e){stat(explain(e))}
+    sm();
+  }
+  function open(){
+    showModal('<div class="big">☁️</div><h3>GitHub backup</h3>'+
+      '<p style="margin:6px 0 0;font-size:.85rem">Every change is saved to a private GitHub repo automatically: a <b>latest</b> file plus one snapshot per day. Open the site on any device with the same details and it loads your newest backup.</p>'+
+      '<div class="ghf">'+
+      '<label>Repository (owner/name)<input id="ghRepo" placeholder="yourname/show-up-backups" autocomplete="off" autocapitalize="none" spellcheck="false"></label>'+
+      '<label>Access token<input id="ghTok" type="password" placeholder="github_pat_..." autocomplete="off"></label>'+
+      '<label>Branch (leave empty for the default)<input id="ghBr" placeholder="main" autocomplete="off" autocapitalize="none" spellcheck="false"></label>'+
+      '</div>'+
+      '<div class="ghrow"><button class="pill on" id="ghSave" type="button">Save &amp; back up now</button><button class="pill" id="ghRest" type="button">Restore from GitHub</button><button class="pill" id="ghOff" type="button">Disconnect</button></div>'+
+      '<div class="ghst" id="ghst" role="status"></div><div id="ghPick"></div>'+
+      '<div class="ghhelp">Create the token at <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">github.com/settings/personal-access-tokens/new</a>. Choose <b>Only select repositories</b> and pick just the backup repo, then set <b>Contents</b> to <b>Read and write</b>. The token stays in this browser only, so enter it once on each device. Use a private repo.</div>','Close');
+    $('ghRepo').value=cfg.repo||'';$('ghTok').value=cfg.token||'';$('ghBr').value=cfg.branch||'';
+    if(lastMsg)$('ghst').textContent=lastMsg;
+    $('ghSave').onclick=async function(){
+      cfg={repo:$('ghRepo').value.trim().replace(/^https?:\/\/github\.com\//,'').replace(/\.git$/,'').replace(/\/$/,''),token:$('ghTok').value.trim(),branch:$('ghBr').value.trim()};
+      if(!on()){$('ghst').textContent='Enter the repository as owner/name and paste the token.';return}
+      saveCfg();sm();last='';
+      await init();
+    };
+    $('ghOff').onclick=function(){cfg={};saveCfg();last='';clearTimeout(timer);sm();stat('Saved on this device only');$('ghRepo').value='';$('ghTok').value='';$('ghBr').value=''};
+    $('ghRest').onclick=async function(){
+      if(!on()){$('ghst').textContent='Connect a repository first.';return}
+      $('ghst').textContent='Loading your backups…';
+      try{
+        var list=await (async function(){
+          var r=await fetch(url('snapshots')+q(),{headers:hdr(),cache:'no-store'});
+          if(r.status===404)return[];if(!r.ok)throw fail(r);return r.json()})();
+        var days=list.filter(function(x){return /\.json$/.test(x.name)}).map(function(x){return x.name.replace(/\.json$/,'')}).sort().reverse();
+        $('ghPick').innerHTML='<div class="ghf"><label>Restore from<select id="ghSel"><option value="latest">Latest backup</option>'+days.map(function(d){return '<option value="'+d+'">Snapshot '+d+'</option>'}).join('')+'</select></label></div><div class="ghrow"><button class="pill on" id="ghGo" type="button">Restore this backup</button></div>';
+        $('ghst').textContent=days.length?'Pick a backup to restore. This replaces your current marks and weights.':'No snapshots yet. You can restore the latest backup.';
+        $('ghGo').onclick=async function(){
+          var v=$('ghSel').value;
+          try{
+            var f=await getFile(v==='latest'?'backups/latest.json':'snapshots/'+v+'.json');
+            if(!f||!f.content){$('ghst').textContent='That backup was not found.';return}
+            var j=JSON.parse(unb64(f.content)),n=Object.keys(clean(j)).length;
+            if(confirm('Restore '+n+' marked days from '+(v==='latest'?'the latest backup':v)+'? This replaces your current data.')){
+              applyData(j,false);$('ghst').textContent='Restored.';
+            }
+          }catch(e){$('ghst').textContent=explain(e)}
+        };
+      }catch(e){$('ghst').textContent=explain(e)}
+    };
+  }
+  $('ghBtn').onclick=open;
+  sm();
+  setTimeout(init,700);
+})();
+</script>
+
 </body>
 </html>
